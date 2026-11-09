@@ -1,0 +1,41 @@
+# Push to `sit` → test + build on GitHub (Linux x86-64) → deploy to the ReadyIDC box as app `line-bot`
+# (https://line-bot.develyst.online). The server checks /health and rolls back by itself if the new build does not come up.
+# Secrets (repo settings): DEPLOY_SSH_KEY (CI-only key for this repo; the server lets it run deploy only),
+# DEPLOY_KNOWN_HOSTS (the server's host key). Set up by Otto, 2026-11-10 (workspace SERVER-FACTS S2).
+# The repo has no build script, so the binary is compiled here; no app code change was needed.
+name: deploy-sit
+
+on:
+  push:
+    branches: [sit]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-sit
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      # The unit tests use a local fake LINE (no network, no DB); a failure stops the deploy.
+      - run: bun test --timeout 20000
+      - run: bun build src/index.ts --compile --minify --target=bun-linux-x64 --outfile dist/develyst-line-bot
+      - run: tar -czf app.tgz --mode=755 -C dist develyst-line-bot
+      - name: deploy
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -o StrictHostKeyChecking=yes -o BatchMode=yes deploy@43.228.86.89 line-bot < app.tgz
