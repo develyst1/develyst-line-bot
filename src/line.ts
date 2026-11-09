@@ -62,3 +62,28 @@ export async function pushToLine(
     return { ok: false, status: null };
   }
 }
+
+/**
+ * LINE's read-only "Get group member profile": GET {apiBase}/v2/bot/group/{groupId}/member/{userId}. The ONLY call besides the
+ * owner-approved push, and it sends no message. No base / token, a non-200, a timeout or a bad body all give null (never blocks storing).
+ */
+export async function getGroupMemberName(
+  cfg: { apiBase: string; accessToken: string },
+  groupId: string,
+  userId: string,
+  fetchImpl: FetchLike,
+): Promise<string | null> {
+  if (!cfg.apiBase || !cfg.accessToken) return null;
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v2/bot/group/${encodeURIComponent(groupId)}/member/${encodeURIComponent(userId)}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${cfg.accessToken}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { displayName?: unknown };
+    return typeof j.displayName === "string" && j.displayName ? j.displayName : null;
+  } catch {
+    return null;
+  }
+}

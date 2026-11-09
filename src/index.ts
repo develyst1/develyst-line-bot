@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
-import { buildPushBody, pushToLine, verifySignature, type FetchLike } from "./line";
+import { buildPushBody, getGroupMemberName, pushToLine, verifySignature, type FetchLike } from "./line";
 import { createStore, IMG_TYPES, sniffImage, type Store } from "./store";
+import { createMessageStore, MAX_RECORD_TEXT, safeKind, type MessageStore } from "./messages";
 
 export interface Config {
   channelSecret: string;
@@ -12,6 +13,10 @@ export interface Config {
   publicBaseUrl: string;
   dataDir: string;
   port: number;
+  /** TRUE ONLY when RECORD_GROUP_MESSAGES is exactly "true" (the owner's step, after he told the group). Anything else = nothing is stored. */
+  recordMessages: boolean;
+  /** Recorded messages older than this are dropped on every write. */
+  retentionDays: number;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -24,8 +29,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     publicBaseUrl: trim(env.PUBLIC_BASE_URL),
     dataDir: env.DATA_DIR?.trim() || "./data",
     port: Number(env.PORT) || 3100,
+    recordMessages: (env.RECORD_GROUP_MESSAGES ?? "").trim() === "true",
+    retentionDays: Number.isInteger(Number(env.MESSAGE_RETENTION_DAYS)) && Number(env.MESSAGE_RETENTION_DAYS) >= 1 ? Number(env.MESSAGE_RETENTION_DAYS) : 90,
   };
 }
+
+export const MAX_MESSAGES_LIMIT = 500;
+export const DEFAULT_MESSAGES_LIMIT = 200;
 
 export const MAX_TEXT = 4000;
 export const MAX_IMAGES = 3;
@@ -41,14 +51,63 @@ const sameSecret = (given: string, expected: string): boolean => expected !== ""
 
 const err = (code: string, message: string) => ({ error: { code, message } });
 
-export function createApp(cfg: Config, deps: { fetch?: FetchLike; store?: Store } = {}) {
+interface LineEvent {
+  type?: string;
+  timestamp?: number;
+  source?: { type?: string; groupId?: string; userId?: string };
+  message?: { id?: string; type?: string; text?: string };
+  unsend?: { messageId?: string };
+}
+
+export function createApp(cfg: Config, deps: { fetch?: FetchLike; store?: Store; messages?: MessageStore; now?: () => Date } = {}) {
+  const now = deps.now ?? (() => new Date());
   const store = deps.store ?? createStore(cfg.dataDir);
+  const messages = deps.messages ?? createMessageStore(cfg.dataDir, now);
   const fetchImpl: FetchLike = deps.fetch ?? ((u, i) => fetch(u, i));
   const app = new Hono();
 
-  app.get("/health", (c) => c.json({ ok: true, groupKnown: store.readGroup() !== null }));
+  const keyOk = (c: { req: { header: (n: string) => string | undefined } }): boolean => {
+    const m = /^Bearer (.+)$/.exec(c.req.header("authorization") ?? "");
+    return !!m && sameSecret(m[1]!, cfg.sendKey);
+  };
 
-  // ── LINE → us. Nothing is stored or logged except the group id of a `join` into a group. ──
+  /** The sender's display name: cached per user in members.json, else LINE's read-only profile GET; any failure is null and never blocks storing. */
+  const nameOf = async (groupId: string, userId: string): Promise<string | null> => {
+    const cached = messages.memberName(userId);
+    if (cached) return cached;
+    const n = await getGroupMemberName({ apiBase: cfg.apiBase, accessToken: cfg.accessToken }, groupId, userId, fetchImpl);
+    if (n) messages.setMemberName(userId, n);
+    return n;
+  };
+
+  /** Recording (REQ-5012 phase 2). Only called when RECORD_GROUP_MESSAGES=true, and only for the stored group. */
+  const record = async (e: LineEvent, groupId: string): Promise<void> => {
+    if (e.type === "message" && typeof e.message?.id === "string" && e.message.id) {
+      const id = e.message.id;
+      if (messages.has(id)) return; // a redelivered webhook stores once (and asks LINE for nothing)
+      const kind = safeKind(e.message.type);
+      const userId = typeof e.source?.userId === "string" && e.source.userId ? e.source.userId : null;
+      const at = typeof e.timestamp === "number" && !Number.isNaN(new Date(e.timestamp).getTime()) ? new Date(e.timestamp) : now();
+      messages.add(
+        {
+          id,
+          at: at.toISOString(),
+          userId,
+          name: userId ? await nameOf(groupId, userId) : null,
+          kind,
+          // content other than text is never downloaded or stored: a placeholder only
+          text: kind === "text" ? String(e.message.text ?? "").slice(0, MAX_RECORD_TEXT) : `[${kind}]`,
+        },
+        cfg.retentionDays,
+      );
+    } else if (e.type === "unsend" && typeof e.unsend?.messageId === "string") {
+      messages.markUnsent(e.unsend.messageId);
+    }
+  };
+
+  app.get("/health", (c) => c.json({ ok: true, groupKnown: store.readGroup() !== null, recording: cfg.recordMessages }));
+
+  // ── LINE → us. Stored: the group id of a `join`; and, ONLY when RECORD_GROUP_MESSAGES=true, that group's messages. ──
   app.post("/line/webhook", async (c) => {
     const len = Number(c.req.header("content-length") ?? 0);
     if (len > MAX_WEBHOOK_BYTES) return c.json(err("TOO_LARGE", "Body too large"), 413);
@@ -62,21 +121,44 @@ export function createApp(cfg: Config, deps: { fetch?: FetchLike; store?: Store 
     } catch {
       return c.json(err("VALIDATION", "Body is not JSON"), 400);
     }
-    for (const e of events as { type?: string; source?: { type?: string; groupId?: string }; timestamp?: number }[]) {
+    for (const e of events as LineEvent[]) {
       if (e?.type === "join" && e.source?.type === "group" && typeof e.source.groupId === "string" && e.source.groupId) {
         const at = typeof e.timestamp === "number" ? new Date(e.timestamp) : new Date();
         store.saveGroup({ groupId: e.source.groupId, joinedAt: (Number.isNaN(at.getTime()) ? new Date() : at).toISOString() });
+        continue;
       }
-      // every other event (a message, a follow, …) is answered 200 and dropped: no text, no user id is kept
+      // recording is OFF unless the owner turned it on; any other group, a room or a 1:1 chat is dropped
+      if (!cfg.recordMessages || e?.source?.type !== "group") continue;
+      const g = store.readGroup();
+      if (!g || e.source.groupId !== g.groupId) continue;
+      try {
+        await record(e, g.groupId);
+      } catch (err) {
+        console.error("record failed", err instanceof Error ? err.name : "error"); // the name only: never message text
+      }
+      // every other event is answered 200 and dropped
     }
     return c.json({ ok: true });
   });
 
   // ── the desk → us → LINE ──
+  // ── the desk reads what the bot recorded (same key as /send) ──
+  app.get("/messages", (c) => {
+    if (!keyOk(c)) return c.json(err("UNAUTHORIZED", "Bad key"), 401);
+    const rawLimit = c.req.query("limit");
+    let limit = DEFAULT_MESSAGES_LIMIT;
+    if (rawLimit !== undefined) {
+      if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > MAX_MESSAGES_LIMIT) return c.json(err("VALIDATION", `limit is 1–${MAX_MESSAGES_LIMIT}`), 400);
+      limit = Number(rawLimit);
+    }
+    if (!cfg.recordMessages) return c.json({ messages: [], recording: false }); // so the desk knows WHY it is empty
+    const r = messages.query(c.req.query("since") || null, limit);
+    if (!r) return c.json(err("VALIDATION", "since must be an ISO time or a known message id"), 400);
+    return c.json(r);
+  });
+
   app.post("/send", async (c) => {
-    const auth = c.req.header("authorization") ?? "";
-    const m = /^Bearer (.+)$/.exec(auth);
-    if (!m || !sameSecret(m[1]!, cfg.sendKey)) return c.json(err("UNAUTHORIZED", "Bad key"), 401);
+    if (!keyOk(c)) return c.json(err("UNAUTHORIZED", "Bad key"), 401);
 
     if (Number(c.req.header("content-length") ?? 0) > MAX_SEND_BYTES) return c.json(err("VALIDATION", "Request too large"), 400);
     let form: FormData;

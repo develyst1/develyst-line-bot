@@ -46,6 +46,8 @@ const cfg = (o: Partial<Config> = {}): Config => ({
   publicBaseUrl: PUBLIC,
   dataDir: dir,
   port: 0,
+  recordMessages: false,
+  retentionDays: 90,
   ...o,
 });
 const sign = (body: string | Uint8Array, secret = SECRET) => createHmac("sha256", secret).update(body).digest("base64");
@@ -103,7 +105,7 @@ describe("the webhook events", () => {
     expect(Object.keys(g).sort()).toEqual(["groupId", "joinedAt"]);
     expect(g.groupId).toBe("Csecond");
     expect(g.joinedAt).toBe("2023-11-14T22:13:20.000Z");
-    expect(await (await app.request("/health")).json()).toEqual({ ok: true, groupKnown: true });
+    expect(await (await app.request("/health")).json()).toEqual({ ok: true, groupKnown: true, recording: false });
   });
   test("a message event stores nothing and answers 200; no user id or text reaches the disk", async () => {
     const app = createApp(cfg());
@@ -117,7 +119,7 @@ describe("the webhook events", () => {
     expect((await hook(app, room)).status).toBe(200);
     expect((await hook(app, JSON.stringify({ events: [] }))).status).toBe(200);
     expect(existsSync(join(dir, "group.json"))).toBe(false);
-    expect(await (await app.request("/health")).json()).toEqual({ ok: true, groupKnown: false });
+    expect(await (await app.request("/health")).json()).toEqual({ ok: true, groupKnown: false, recording: false });
   });
   test("a signed body that is not JSON is 400", async () => {
     expect((await hook(createApp(cfg()), "not json")).status).toBe(400);
@@ -367,7 +369,7 @@ describe("/health, errors, secrets", () => {
     const app = createApp(cfg());
     await withGroup(app);
     const t = await (await app.request("/health")).text();
-    expect(JSON.parse(t)).toEqual({ ok: true, groupKnown: true });
+    expect(JSON.parse(t)).toEqual({ ok: true, groupKnown: true, recording: false });
     for (const s of [SECRET, TOKEN, KEY, "Cgroup1"]) expect(t).not.toContain(s);
   });
   test("an unknown route is a JSON 404", async () => {
